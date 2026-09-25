@@ -1,0 +1,9 @@
+student_resource/dataset/
+*.csv
+*.parquet
+*.pkl
+*.zip
+*.bin
+*.pth
+models/
+__pycache__/

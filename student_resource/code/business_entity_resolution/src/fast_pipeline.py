@@ -1,0 +1,440 @@
+"""Disk-backed selective blocking baseline. No all-target matrix multiplication."""
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import re
+import sqlite3
+import time
+from collections import Counter
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from rapidfuzz import fuzz
+from sklearn.model_selection import GroupKFold
+import lightgbm as lgb
+
+from .normalize import normalize_name, normalize_address
+from .features import build_features, add_rank_features, model_columns
+from .metrics import truth_map, tune_threshold, predictions_at_threshold
+from .pipeline import model_params, candidate_recall, labels_for_candidates
+
+VERSION = "selective-blocks-v3"
+FIELDS = ["entity_id", "business_name", "business_address", "country"]
+PAIR_FIELDS = ["source1_entity_id", "candidate_entity_id", "char_name", "char_address", "bm25", "retrieval_methods"]
+
+
+def rows(path):
+    with Path(path).open(encoding="utf-8-sig", newline="") as stream:
+        yield from csv.DictReader(stream, delimiter="\t")
+
+
+def digest_files(paths):
+    result = hashlib.sha256(VERSION.encode())
+    for path in paths:
+        print(f"Checking input fingerprint: {path.name}", flush=True)
+        result.update(path.name.encode())
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                result.update(block)
+    return result.hexdigest()
+
+
+def keys(name, address, country):
+    name = normalize_name(name, True)
+    address = normalize_address(address)
+    country = country.strip().casefold()
+    tokens = sorted({t for t in name.split() if len(t) >= 3}, key=lambda t: (-len(t), t))[:4]
+    values = set()
+    if name:
+        values.update(("n:" + name, "s:" + " ".join(sorted(name.split()))))
+        compact = name.replace(" ", "")
+        grams = {compact[i:i+4] for i in range(max(0, len(compact)-3))}
+        # Stable anchors give typo tolerance without indexing every character gram.
+        anchors = sorted(grams, key=lambda g: hashlib.blake2b(g.encode(), digest_size=8).digest())[:3]
+        values.update("g:" + g for g in anchors)
+    if address:
+        values.add("a:" + address)
+        address_tokens = sorted({t for t in address.split() if len(t) >= 4}, key=lambda t: (-len(t), t))[:5]
+        values.update("at:" + t for t in address_tokens)
+        number_tokens = sorted({t for t in re.findall(r"\d+", address) if len(t) >= 3}, key=lambda t: (-len(t), t))[:2]
+        values.update("an:" + t for t in number_tokens)
+        all_numbers = re.findall(r"\d+", address)
+        anchors = sorted(set(all_numbers[:1] + number_tokens[:1]))
+        values.update("ax:" + token + ":" + number for token in address_tokens[:3] for number in anchors)
+    values.update("t:" + t for t in tokens)
+    values.update("p:" + t[:5] for t in tokens if len(t) >= 5)
+    numbers = [t for t in address.split() if t.isdigit()]
+    if numbers and name:
+        values.add("d:" + name[:5] + ":" + numbers[0])
+    return sorted(hashlib.blake2b((country + "\0" + value).encode(), digest_size=12).digest() for value in values)
+
+
+def progress(label, done, total, started, measured=None):
+    fraction = done / max(total, 1)
+    elapsed = time.monotonic() - started
+    speed = (done if measured is None else measured) / max(elapsed, .001)
+    bar = "#" * min(25, int(25*fraction))
+    eta = f"{(total-done)/speed/60:.1f}m" if speed else "pending new work"
+    print(f"\r{label} [{bar:<25}] {fraction:6.1%} {done:,}/{total:,} | {speed:.1f} new/s | ETA {eta}", end="", flush=True)
+
+
+class Index:
+    def __init__(self, path, cache_mb=512, index_batch=10000):
+        if cache_mb < 16 or index_batch < 1:
+            raise ValueError("cache_mb must be >=16 and index_batch must be positive")
+        self.index_batch = index_batch
+        self.db = sqlite3.connect(path)
+        self.db.execute(f"PRAGMA cache_size=-{int(cache_mb)*1024}")
+        self.db.execute("PRAGMA temp_store=FILE")
+        self.db.execute("PRAGMA journal_mode=WAL")
+        # Fewer small checkpoints; retain SQLite's FULL durability setting.
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("PRAGMA wal_autocheckpoint=16384")
+        self.db.execute("PRAGMA journal_size_limit=67108864")
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS records(rid INTEGER PRIMARY KEY, entity_id TEXT UNIQUE,
+              business_name TEXT, business_address TEXT, country TEXT);
+            CREATE TABLE IF NOT EXISTS blocks(key BLOB, rid INTEGER, PRIMARY KEY(key,rid)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);
+        """)
+
+    def meta(self, key):
+        row = self.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def put(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", (key, json.dumps(value)))
+
+    def build(self, paths):
+        fingerprint = digest_files(paths)
+        previous = self.meta("fingerprint")
+        if previous and previous != fingerprint:
+            raise ValueError("Index inputs/version changed. Choose a NEW --work-dir; existing cache was preserved.")
+        if self.meta("complete"):
+            print("Reusing completed target index", flush=True)
+            return
+        if not previous:
+            self.put("fingerprint", fingerprint)
+            self.db.commit()
+        done = self.meta("done") or 0
+        print(f"Building/resuming target index after {done:,} committed records", flush=True)
+        total = self.meta("total")
+        if total is None:
+            total = sum(sum(1 for _ in rows(p)) for p in paths)
+            self.put("total", total)
+            self.db.commit()
+        pending, postings, started = [], [], time.monotonic()
+        last_commit = started
+        last_number = done
+        number = 0
+        for path in paths:
+            for record in rows(path):
+                number += 1
+                if number <= done:
+                    continue
+                if not record["entity_id"]:
+                    raise ValueError("Empty target ID")
+                pending.append((number, *(record[f] for f in FIELDS)))
+                postings.extend((key, number) for key in keys(record["business_name"], record["business_address"], record["country"]))
+                if len(pending) >= self.index_batch:
+                    write_started = time.monotonic()
+                    self._flush(pending, postings, number)
+                    now = time.monotonic()
+                    recent = (number-last_number)/max(now-last_commit,.001)
+                    bar = "#" * min(25, int(25*number/max(total,1)))
+                    print(f"\rIndex [{bar:<25}] {number:,}/{total:,} ({number/max(total,1):.1%}) | recent {recent:.0f} rows/s | DB write {now-write_started:.1f}s | recent ETA {(total-number)/max(recent,.001)/60:.1f}m       ",end="",flush=True)
+                    last_commit, last_number = now, number
+                    pending, postings = [], []
+        if pending:
+            self._flush(pending, postings, number)
+        self.put("complete", True)
+        self.db.commit()
+        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        print("\nTarget index ready", flush=True)
+
+    def _flush(self, records, postings, done):
+        # Primary key order turns random per-record key writes into a sorted
+        # batch, reducing repeated B-tree page visits. Contents are unchanged.
+        postings.sort()
+        with self.db:
+            self.db.executemany("INSERT INTO records VALUES (?,?,?,?,?)", records)
+            self.db.executemany("INSERT INTO blocks VALUES (?,?)", postings)
+            self.put("done", done)
+
+    def retrieve(self, query, cap=256, top=60):
+        votes = Counter()
+        for key in keys(query["business_name"], query["business_address"], query["country"]):
+            hits = self.db.execute("SELECT rid FROM blocks WHERE key=? LIMIT ?", (key, cap+1)).fetchall()
+            # Broad blocks are deliberately skipped, not arbitrarily truncated.
+            if len(hits) <= cap:
+                votes.update(row[0] for row in hits)
+        pool = sorted(votes, key=lambda rid: (-votes[rid], rid))[:1500]
+        found = []
+        for start in range(0, len(pool), 500):
+            ids = pool[start:start+500]
+            found.extend(self.db.execute("SELECT entity_id,business_name,business_address,country,rid FROM records WHERE rid IN (" + ",".join("?" for _ in ids) + ")", ids).fetchall())
+        name = normalize_name(query["business_name"], True)
+        address = normalize_address(query["business_address"])
+        ranked = []
+        for entity_id, target_name, target_address, country, rid in found:
+            normalized_name = normalize_name(target_name, True)
+            normalized_address = normalize_address(target_address)
+            ns = fuzz.ratio(name, normalized_name)/100 if name and normalized_name else 0.
+            ads = fuzz.ratio(address, normalized_address)/100 if address and normalized_address else 0.
+            rank = max(.7*ns+.3*ads, .15*ns+.85*ads)
+            ranked.append((rank, entity_id, ns, ads, votes[rid], (entity_id, target_name, target_address, country)))
+        ranked.sort(key=lambda row: (-row[0], row[1]))
+        selected = ranked[:top]
+        pairs = [(query["entity_id"], r[1], r[2], r[3], float(r[4]), 1.) for r in selected]
+        return pairs, [r[5] for r in selected]
+
+
+def featurize(index, batch, args):
+    pairs, targets = [], {}
+    for query in batch:
+        found, records = index.retrieve(query, args.block_cap, args.candidates)
+        pairs.extend(found)
+        targets.update((r[0], r) for r in records)
+    pairs = pd.DataFrame(pairs, columns=PAIR_FIELDS)
+    if pairs.empty:
+        return pairs, None
+    features = add_rank_features(build_features(pairs, pd.DataFrame(batch), pd.DataFrame(targets.values(), columns=FIELDS)))
+    # New retrieval semantics: these are NOT the old TF-IDF/BM25 scores.
+    features.columns = [c.replace("char_name", "blocking_name").replace("char_address", "blocking_address").replace("bm25", "blocking_votes") for c in features.columns]
+    return pairs, features
+
+
+def sampled_training(directory, count):
+    # Reservoir sampling avoids loading millions of query records into RAM.
+    rng = np.random.default_rng(2026)
+    sample = []
+    for number, row in enumerate(rows(directory / "train_source1.tsv")):
+        if number < count:
+            sample.append(row)
+        else:
+            chosen = int(rng.integers(number+1))
+            if chosen < count:
+                sample[chosen] = row
+    wanted = {r["entity_id"] for r in sample}
+    truth = pd.DataFrame(r for r in rows(directory / "train_ground_truth.tsv") if r["source1_entity_id"] in wanted)
+    labeled = set(truth.source1_entity_id)
+    return [r for r in sample if r["entity_id"] in labeled], truth
+
+
+def train(args):
+    index = Index(args.work_dir / "train.sqlite", args.index_cache_mb, args.index_batch)
+    try:
+        index.build([args.train_dir / f"train_source{i}.tsv" for i in (2,3)])
+        sample, truth = sampled_training(args.train_dir, args.train_queries)
+        parts, candidates, started = [], [], time.monotonic()
+        for start in range(0, len(sample), args.batch):
+            pairs, features = featurize(index, sample[start:start+args.batch], args)
+            candidates.append(pairs)
+            if features is not None:
+                parts.append(features)
+            progress("Training queries", min(start+args.batch,len(sample)), len(sample), started)
+        print()
+        if not parts:
+            raise ValueError("No training candidates found")
+        pairs = pd.concat(candidates, ignore_index=True)
+        recall = candidate_recall(pairs, truth)
+        print("Candidate recall:", recall, flush=True)
+        features = pd.concat(parts, ignore_index=True)
+        features["label"] = labels_for_candidates(features, truth)
+        columns = model_columns(features)
+        folds = min(3, features.source1_entity_id.nunique())
+        if folds < 2:
+            raise ValueError("Need at least two query groups")
+        oof = features[["source1_entity_id", "candidate_entity_id"]].copy()
+        oof["probability"] = 0.
+        models = []
+        for fold, (tr, va) in enumerate(GroupKFold(folds).split(features, groups=features.source1_entity_id)):
+            if features.iloc[tr].label.nunique() < 2:
+                raise ValueError("One-class fold; increase training sample")
+            print(f"Training fold {fold+1}/{folds}", flush=True)
+            params = model_params(2026+fold)
+            params["n_jobs"] = args.threads
+            model = lgb.LGBMClassifier(**params)
+            model.fit(features.iloc[tr][columns], features.iloc[tr].label,
+                eval_set=[(features.iloc[va][columns], features.iloc[va].label)],
+                callbacks=[lgb.early_stopping(80, verbose=False)])
+            oof.loc[va,"probability"] = model.predict_proba(features.iloc[va][columns])[:,1]
+            models.append(model)
+        threshold, score, table = tune_threshold(oof, truth_map(truth))
+        table.to_csv(args.work_dir / "fast_thresholds.csv", index=False)
+        metadata = dict(version=VERSION, threshold=threshold, oof_score=score, candidate_recall=recall,
+                        block_cap=args.block_cap, candidates=args.candidates, training_queries=len(sample))
+        joblib.dump(dict(metadata, models=models, columns=columns), args.work_dir / "fast_model.joblib.tmp")
+        (args.work_dir / "fast_model.joblib.tmp").replace(args.work_dir / "fast_model.joblib")
+        (args.work_dir / "fast_metrics.json").write_text(json.dumps(metadata, indent=2))
+        print(json.dumps(metadata, indent=2), flush=True)
+    finally:
+        index.db.close()
+
+
+def predict(args):
+    saved = joblib.load(args.work_dir / "fast_model.joblib")
+    for model in saved["models"]:
+        model.set_params(n_jobs=args.threads)
+    if saved["version"] != VERSION or saved["block_cap"] != args.block_cap or saved["candidates"] != args.candidates:
+        raise ValueError("Retrieval settings differ from trained model")
+    index = Index(args.work_dir / "test.sqlite", args.index_cache_mb, args.index_batch)
+    try:
+        index.build([args.test_dir / f"test_source{i}.tsv" for i in (2,3)])
+        source = args.test_dir / "test_source1.tsv"
+        fingerprint = digest_files([source, args.work_dir / "fast_model.joblib"])
+        signature = [fingerprint, index.meta("fingerprint"), args.part, args.parts, args.batch, args.block_cap, args.candidates]
+        folder = args.output_dir / (f"benchmark-{args.part}" if args.command == "benchmark" else f"part-{args.part}")
+        folder.mkdir(parents=True, exist_ok=True)
+        manifest = folder / "manifest.json"
+        if manifest.exists() and json.loads(manifest.read_text()) != signature:
+            raise ValueError("Prediction inputs/settings changed; use a NEW --output-dir")
+        manifest.write_text(json.dumps(signature))
+        total, benchmark_sample = 0, []
+        rng = np.random.default_rng(2026)
+        eligible = 0
+        for number, query in enumerate(rows(source)):
+            total += 1
+            if args.command == "benchmark" and number % args.parts == args.part:
+                eligible += 1
+                if len(benchmark_sample) < args.benchmark_queries:
+                    benchmark_sample.append((number, query))
+                else:
+                    position = int(rng.integers(eligible))
+                    if position < args.benchmark_queries:
+                        benchmark_sample[position] = (number, query)
+        count = (total + args.parts - 1 - args.part)//args.parts
+        if args.command == "benchmark":
+            count = len(benchmark_sample)
+            print("Benchmark countries:", dict(Counter(q["country"] for _,q in benchmark_sample)), flush=True)
+        done, executed, started, batch = 0, 0, time.monotonic(), []
+        def process(batch, offset):
+            destination = folder / f"batch-{offset:09d}.json"
+            if destination.exists() and args.command != "benchmark":
+                return False
+            pairs, features = featurize(index, batch, args)
+            predicted = {}
+            if features is not None:
+                probability = np.zeros(len(features))
+                for model in saved["models"]:
+                    probability += model.predict_proba(features[saved["columns"]])[:,1] / len(saved["models"])
+                scored = features[["source1_entity_id","candidate_entity_id"]].copy()
+                scored["probability"] = probability
+                predicted = predictions_at_threshold(scored, saved["threshold"])
+            groups = pairs.groupby("source1_entity_id").candidate_entity_id.agg(list).to_dict()
+            result = [(q["entity_id"], groups.get(q["entity_id"],[]), sorted(predicted.get(q["entity_id"],set()))) for q in batch]
+            temporary = destination.with_suffix(".tmp")
+            temporary.write_text(json.dumps(result), encoding="utf-8")
+            temporary.replace(destination)
+            return True
+        stream = benchmark_sample if args.command == "benchmark" else enumerate(rows(source))
+        for number, query in stream:
+            if number % args.parts != args.part:
+                continue
+            batch.append(query)
+            if len(batch) == args.batch:
+                if process(batch, done):
+                    executed += len(batch)
+                done += len(batch)
+                batch = []
+                progress("Prediction", done, count, started, measured=executed)
+                if args.command == "benchmark" and executed >= args.benchmark_queries:
+                    break
+        else:
+            if batch:
+                if process(batch, done):
+                    executed += len(batch)
+                done += len(batch)
+                progress("Prediction", done, count, started, measured=executed)
+        elapsed = time.monotonic()-started
+        speed = executed/max(elapsed,.001)
+        print(f"\nNew predictions: {executed:,}; wall time {elapsed:.1f}s; {speed:.2f} queries/s", flush=True)
+        if args.command == "benchmark":
+            print(f"EXTRAPOLATION ONLY: {total/max(speed,.001)/3600:.1f} hours for all queries, excluding indexing; test other countries too.")
+        else:
+            (folder / "complete.json").write_text(json.dumps(dict(rows=done, signature=signature)))
+            print("Prediction part complete. Run merge to generate final TSVs.")
+    finally:
+        index.db.close()
+
+
+def merge(args):
+    folders = [args.output_dir / f"part-{p}" for p in range(args.parts)]
+    signatures = []
+    for part, folder in enumerate(folders):
+        info = json.loads((folder / "complete.json").read_text())
+        signature = info["signature"]
+        if signature[2:4] != [part,args.parts]:
+            raise ValueError("Wrong prediction partition")
+        signatures.append(signature[:2] + signature[4:])
+    if any(s != signatures[0] for s in signatures):
+        raise ValueError("Parts used different models/data/settings")
+    import tempfile
+    with tempfile.TemporaryDirectory(dir=args.output_dir) as temporary:
+        database = sqlite3.connect(str(Path(temporary)/"merge.sqlite"))
+        try:
+            database.execute("CREATE TABLE results(id TEXT PRIMARY KEY,candidates TEXT,matches TEXT)")
+            for folder in folders:
+                for path in sorted(folder.glob("batch-*.json")):
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    database.executemany("INSERT INTO results VALUES (?,?,?)", [(eid,",".join(c),",".join(m)) for eid,c,m in data])
+                database.commit()
+            paths = [args.output_dir / f"{name}.tsv.partial" for name in ("candidate_pairs","matching_results")]
+            with paths[0].open("w",encoding="utf-8",newline="") as cf, paths[1].open("w",encoding="utf-8",newline="") as mf:
+                cw,mw = csv.writer(cf,delimiter="\t"),csv.writer(mf,delimiter="\t")
+                cw.writerow(["source1_entity_id","candidate_entity_ids"])
+                mw.writerow(["source1_entity_id","matched_entity_ids"])
+                count = 0
+                for row in rows(args.test_dir / "test_source1.tsv"):
+                    found = database.execute("SELECT candidates,matches FROM results WHERE id=?",(row["entity_id"],)).fetchone()
+                    if found is None:
+                        raise ValueError(f"Missing prediction: {row['entity_id']}")
+                    cw.writerow([row["entity_id"],found[0]])
+                    mw.writerow([row["entity_id"],found[1]])
+                    count += 1
+                if count != database.execute("SELECT COUNT(*) FROM results").fetchone()[0]:
+                    raise ValueError("Unexpected prediction IDs")
+            for path in paths:
+                path.replace(path.with_suffix(""))
+            print(f"Merged {count:,} query predictions; run the supplied validator next.")
+        finally:
+            database.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=["train","benchmark","predict","merge"])
+    parser.add_argument("--train-dir", type=Path, default=Path("dataset/train"))
+    parser.add_argument("--test-dir", type=Path, default=Path("dataset/test"))
+    parser.add_argument("--work-dir", type=Path, default=Path("artifacts_fast"))
+    parser.add_argument("--output-dir", type=Path, default=Path("output_fast"))
+    parser.add_argument("--train-queries", type=int, default=2000)
+    parser.add_argument("--block-cap", type=int, default=256)
+    parser.add_argument("--candidates", type=int, default=60)
+    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--index-cache-mb", type=int, default=512)
+    parser.add_argument("--index-batch", type=int, default=10000)
+    parser.add_argument("--benchmark-queries", type=int, default=2048)
+    parser.add_argument("--part", type=int, default=0)
+    parser.add_argument("--parts", type=int, default=1)
+    args = parser.parse_args()
+    if min(args.threads,args.batch,args.parts,args.candidates,args.block_cap,args.train_queries,args.benchmark_queries)<1 or not 0<=args.part<args.parts:
+        parser.error("Sizes must be positive; require 0 <= part < parts")
+    args.work_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.command == "train":
+        train(args)
+    elif args.command == "merge":
+        merge(args)
+    else:
+        predict(args)
+
+
+if __name__ == "__main__":
+    main()

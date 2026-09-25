@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from functools import lru_cache
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler, Levenshtein
 
@@ -32,16 +33,21 @@ def build_features(
     source1: pd.DataFrame,
     targets: pd.DataFrame,
 ) -> pd.DataFrame:
-    left = source1.set_index("entity_id", drop=False)
-    right = targets.set_index("entity_id", drop=False)
+    if source1.entity_id.duplicated().any() or targets.entity_id.duplicated().any():
+        raise ValueError("Duplicate entity IDs within a source/target set")
+    left = {row.entity_id: row for row in source1.itertuples(index=False)}
+    right = {row.entity_id: row for row in targets.itertuples(index=False)}
+    name = lru_cache(maxsize=50000)(normalize_name)
+    address = lru_cache(maxsize=50000)(normalize_address)
+    text = lru_cache(maxsize=50000)(normalize_text)
     rows = []
     for pair in candidate_pairs.itertuples(index=False):
-        a = left.loc[pair.source1_entity_id]
-        b = right.loc[pair.candidate_entity_id]
-        name_a, name_b = normalize_name(a.business_name), normalize_name(b.business_name)
-        core_a, core_b = normalize_name(a.business_name, True), normalize_name(b.business_name, True)
-        addr_a, addr_b = normalize_address(a.business_address), normalize_address(b.business_address)
-        original_a, original_b = normalize_text(a.business_name), normalize_text(b.business_name)
+        a = left[pair.source1_entity_id]
+        b = right[pair.candidate_entity_id]
+        name_a, name_b = name(a.business_name), name(b.business_name)
+        core_a, core_b = name(a.business_name, True), name(b.business_name, True)
+        addr_a, addr_b = address(a.business_address), address(b.business_address)
+        original_a, original_b = text(a.business_name), text(b.business_name)
         name_tokens_a, name_tokens_b = set(core_a.split()), set(core_b.split())
         addr_tokens_a, addr_tokens_b = set(addr_a.split()), set(addr_b.split())
         digits_a, digits_b = digits(a.business_address), digits(b.business_address)
@@ -78,7 +84,12 @@ def build_features(
             "original_script_name_ratio": fuzz.ratio(original_a, original_b) / 100,
             "same_target_source": 2.0 if str(pair.candidate_entity_id).startswith("S2-") else 3.0,
         })
-    return pd.DataFrame(rows)
+        if len(rows) % 10000 == 0:
+            print(f"  Features {len(rows):,}/{len(candidate_pairs):,}", flush=True)
+    result = pd.DataFrame(rows)
+    numeric = result.select_dtypes(include="number").columns
+    result[numeric] = result[numeric].astype(np.float32)
+    return result
 
 
 def add_rank_features(features: pd.DataFrame) -> pd.DataFrame:
@@ -98,4 +109,3 @@ def add_rank_features(features: pd.DataFrame) -> pd.DataFrame:
 def model_columns(df: pd.DataFrame) -> list[str]:
     excluded = {"source1_entity_id", "candidate_entity_id", "label", "fold", "probability"}
     return [c for c in df.columns if c not in excluded and np.issubdtype(df[c].dtype, np.number)]
-

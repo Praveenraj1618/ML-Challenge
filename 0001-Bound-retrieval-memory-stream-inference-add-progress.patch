@@ -1,0 +1,651 @@
+From 5d9121b4ffc561e00ab5cd0bb4ea5f975b27f11b Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 25 Sep 2026 03:33:44 -0300
+Subject: [PATCH] Bound retrieval memory, stream inference, add progress and
+ recovery checkpoint
+
+---
+ student_resource/SCALING_NOTES.md             |  34 ++++
+ .../src/features.py                           |  30 ++-
+ .../src/pipeline.py                           | 113 +++++++++--
+ .../src/retrieval.py                          | 192 ++++++++++++------
+ student_resource/run_full.ps1                 |  11 +-
+ student_resource/run_predict.ps1              |  18 ++
+ student_resource/tests/test_streaming.py      |  56 +++++
+ 7 files changed, 360 insertions(+), 94 deletions(-)
+ create mode 100644 student_resource/SCALING_NOTES.md
+ create mode 100644 student_resource/run_predict.ps1
+ create mode 100644 student_resource/tests/test_streaming.py
+
+diff --git a/student_resource/SCALING_NOTES.md b/student_resource/SCALING_NOTES.md
+new file mode 100644
+index 0000000..1501bf7
+--- /dev/null
++++ b/student_resource/SCALING_NOTES.md
+@@ -0,0 +1,34 @@
++# First-submission recovery build
++
++Run from this directory: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run_full.ps1`
++
++## Changes
++
++- Fit vocabulary and IDF on a deterministic sample of at most 5,000 targets per country. Transform ALL targets in shards of 10,000. This avoids fitting a vocabulary on the entire corpus (max_features alone does not bound the fitting peak).
++- Store sparse shards as memory-mapped arrays under artifacts, clean them on normal exit, and merge shard top-K scores. A common vectorizer per method/country makes shard scores comparable. Tied boundary IDs may vary with shard size.
++- Retain only 256 queries' candidate dictionaries and test features at once; write prediction batches immediately. Candidate K remains 60/60/75. No target subsampling at retrieval time.
++- Train on 2,000 randomly selected labeled queries, keeping ALL training targets as distractors, with three grouped folds. Increase --train-queries only after a successful full submission and a memory/runtime measurement.
++- Cache repeated normalization within feature batches, avoid per-pair pandas lookups, and store numeric features as float32.
++- Fix BM25's duplicate IDF weighting. Vocabulary/IDF sampling and this correction change model scores: retrain, do not reuse an older model.
++- Log index counts, retrieval progress bars, elapsed time/rough ETA, feature counts and training iterations.
++- Save trained_checkpoint.joblib before inference. To restart inference without retraining, run run_predict.ps1. This rebuilds test indexes and restarts prediction from the beginning; it does NOT resume halfway through a test run.
++- Incomplete output uses .partial filenames; final TSVs are replaced only after inference finishes. Do not submit .partial files or older final outputs after a failed run.
++- Reject missing columns, blank/duplicate IDs, invalid batch sizes and one-class training folds. Empty text and countries without targets produce explicit empty candidate rows.
++
++## Remaining limits (important)
++
++Raw TSV tables and their ID lookup indexes still reside in RAM. Disk free space must accommodate sparse indexes for the largest country and output TSVs. Disk-backed retrieval can be I/O-heavy: use a local SSD, not a network drive. This is not a promise that every RAM size or runtime budget will work.
++
++Smaller fit samples can lose rare n-grams. Country blocking can miss cross-country matches; blank countries are matched only to blank countries. Query-grouped validation is not a guarantee of independence between related business entities. Reported sample scores are not leaderboard estimates.
++
++The pipeline reports candidate recall and OOF macro F0.5. Inspect these on the full-target run. Benchmark the first test batches on your machine before estimating completion within a deadline. Keep the laptop plugged in and prevent sleep.
++
++Tests: `python -m unittest discover -s tests -v`
++
++Final validation (extra RAM needed for full ID checking):
++
++```powershell
++python utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir dataset/test --check-ids
++```
++
++Both TSVs are required in the submission. Only load trusted locally-created joblib checkpoints.
+diff --git a/student_resource/code/business_entity_resolution/src/features.py b/student_resource/code/business_entity_resolution/src/features.py
+index dce59da..14597c1 100644
+--- a/student_resource/code/business_entity_resolution/src/features.py
++++ b/student_resource/code/business_entity_resolution/src/features.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import numpy as np
+ import pandas as pd
++from functools import lru_cache
+ from rapidfuzz import fuzz
+ from rapidfuzz.distance import JaroWinkler, Levenshtein
+ 
+@@ -32,16 +33,21 @@ def build_features(
+     source1: pd.DataFrame,
+     targets: pd.DataFrame,
+ ) -> pd.DataFrame:
+-    left = source1.set_index("entity_id", drop=False)
+-    right = targets.set_index("entity_id", drop=False)
++    if source1.entity_id.duplicated().any() or targets.entity_id.duplicated().any():
++        raise ValueError("Duplicate entity IDs within a source/target set")
++    left = {row.entity_id: row for row in source1.itertuples(index=False)}
++    right = {row.entity_id: row for row in targets.itertuples(index=False)}
++    name = lru_cache(maxsize=50000)(normalize_name)
++    address = lru_cache(maxsize=50000)(normalize_address)
++    text = lru_cache(maxsize=50000)(normalize_text)
+     rows = []
+     for pair in candidate_pairs.itertuples(index=False):
+-        a = left.loc[pair.source1_entity_id]
+-        b = right.loc[pair.candidate_entity_id]
+-        name_a, name_b = normalize_name(a.business_name), normalize_name(b.business_name)
+-        core_a, core_b = normalize_name(a.business_name, True), normalize_name(b.business_name, True)
+-        addr_a, addr_b = normalize_address(a.business_address), normalize_address(b.business_address)
+-        original_a, original_b = normalize_text(a.business_name), normalize_text(b.business_name)
++        a = left[pair.source1_entity_id]
++        b = right[pair.candidate_entity_id]
++        name_a, name_b = name(a.business_name), name(b.business_name)
++        core_a, core_b = name(a.business_name, True), name(b.business_name, True)
++        addr_a, addr_b = address(a.business_address), address(b.business_address)
++        original_a, original_b = text(a.business_name), text(b.business_name)
+         name_tokens_a, name_tokens_b = set(core_a.split()), set(core_b.split())
+         addr_tokens_a, addr_tokens_b = set(addr_a.split()), set(addr_b.split())
+         digits_a, digits_b = digits(a.business_address), digits(b.business_address)
+@@ -78,7 +84,12 @@ def build_features(
+             "original_script_name_ratio": fuzz.ratio(original_a, original_b) / 100,
+             "same_target_source": 2.0 if str(pair.candidate_entity_id).startswith("S2-") else 3.0,
+         })
+-    return pd.DataFrame(rows)
++        if len(rows) % 10000 == 0:
++            print(f"  Features {len(rows):,}/{len(candidate_pairs):,}", flush=True)
++    result = pd.DataFrame(rows)
++    numeric = result.select_dtypes(include="number").columns
++    result[numeric] = result[numeric].astype(np.float32)
++    return result
+ 
+ 
+ def add_rank_features(features: pd.DataFrame) -> pd.DataFrame:
+@@ -98,4 +109,3 @@ def add_rank_features(features: pd.DataFrame) -> pd.DataFrame:
+ def model_columns(df: pd.DataFrame) -> list[str]:
+     excluded = {"source1_entity_id", "candidate_entity_id", "label", "fold", "probability"}
+     return [c for c in df.columns if c not in excluded and np.issubdtype(df[c].dtype, np.number)]
+-
+diff --git a/student_resource/code/business_entity_resolution/src/pipeline.py b/student_resource/code/business_entity_resolution/src/pipeline.py
+index 70a0953..5ef1060 100644
+--- a/student_resource/code/business_entity_resolution/src/pipeline.py
++++ b/student_resource/code/business_entity_resolution/src/pipeline.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import json
++import gc
+ from pathlib import Path
+ 
+ import joblib
+@@ -12,7 +13,7 @@ from sklearn.model_selection import GroupKFold
+ 
+ from .features import add_rank_features, build_features, model_columns
+ from .metrics import predictions_at_threshold, truth_map, tune_threshold
+-from .retrieval import RetrievalConfig, generate_candidates
++from .retrieval import RetrievalConfig, iter_candidates
+ 
+ 
+ def read_tsv(path: Path) -> pd.DataFrame:
+@@ -21,7 +22,14 @@ def read_tsv(path: Path) -> pd.DataFrame:
+ 
+ def load_split(directory: Path, prefix: str):
+     frames = [read_tsv(directory / f"{prefix}_source{i}.tsv") for i in (1, 2, 3)]
+-    return frames[0], pd.concat(frames[1:], ignore_index=True)
++    targets = pd.concat(frames[1:], ignore_index=True)
++    for frame in (frames[0], targets):
++        required = {"entity_id", "business_name", "business_address", "country"}
++        if not required.issubset(frame.columns):
++            raise ValueError(f"Missing columns: {required - set(frame.columns)}")
++        if frame.entity_id.eq("").any() or frame.entity_id.duplicated().any():
++            raise ValueError("Entity IDs must be nonempty and unique within source1/combined targets")
++    return frames[0], targets
+ 
+ 
+ def labels_for_candidates(candidates: pd.DataFrame, ground_truth: pd.DataFrame) -> np.ndarray:
+@@ -98,19 +106,60 @@ def write_matching_output(
+     output.to_csv(path, sep="\t", index=False)
+ 
+ 
++def run_inference(args, retrieval_config, fold_models, columns, threshold):
++    print("Generating test candidates and features...")
++    test_s1, test_targets = load_split(args.test_dir, "test")
++    target_lookup = test_targets.set_index("entity_id", drop=False)
++    candidate_path = args.output_dir / "candidate_pairs.tsv.partial"
++    matching_path = args.output_dir / "matching_results.tsv.partial"
++    with candidate_path.open("w", encoding="utf-8", newline="") as candidate_file, matching_path.open("w", encoding="utf-8", newline="") as matching_file:
++        candidate_file.write("source1_entity_id\tcandidate_entity_ids\n")
++        matching_file.write("source1_entity_id\tmatched_entity_ids\n")
++        for batch, pairs in iter_candidates(test_s1, test_targets, retrieval_config, args.work_dir):
++            predicted = {}
++            if len(pairs):
++                selected = target_lookup.loc[pairs.candidate_entity_id.unique()]
++                print(f"Scoring {len(pairs):,} candidate pairs", flush=True)
++                features = add_rank_features(build_features(pairs, batch, selected))
++                probabilities = np.zeros(len(features), dtype=np.float32)
++                for model in fold_models:
++                    probabilities += model.predict_proba(features[columns])[:, 1] / len(fold_models)
++                scored = features[["source1_entity_id", "candidate_entity_id"]].copy()
++                scored["probability"] = probabilities
++                predicted = predictions_at_threshold(scored, threshold)
++                del features, scored, probabilities
++            grouped = pairs.groupby("source1_entity_id").candidate_entity_id.agg(list).to_dict()
++            pd.DataFrame({"source1_entity_id": batch.entity_id,
++                "candidate_entity_ids": [",".join(grouped.get(x, [])) for x in batch.entity_id]}).to_csv(candidate_file, sep="\t", index=False, header=False)
++            pd.DataFrame({"source1_entity_id": batch.entity_id,
++                "matched_entity_ids": [",".join(sorted(predicted.get(x, set()))) for x in batch.entity_id]}).to_csv(matching_file, sep="\t", index=False, header=False)
++            candidate_file.flush()
++            matching_file.flush()
++    candidate_path.replace(args.output_dir / "candidate_pairs.tsv")
++    matching_path.replace(args.output_dir / "matching_results.tsv")
++
++
++
+ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--train-dir", type=Path, required=True)
+     parser.add_argument("--test-dir", type=Path, required=True)
+     parser.add_argument("--output-dir", type=Path, default=Path("output"))
+     parser.add_argument("--work-dir", type=Path, default=Path("artifacts"))
+-    parser.add_argument("--folds", type=int, default=5)
++    parser.add_argument("--folds", type=int, default=3)
++    parser.add_argument("--train-queries", type=int, default=2000)
++    parser.add_argument("--fit-sample", type=int, default=5000)
++    parser.add_argument("--document-batch", type=int, default=10000)
++    parser.add_argument("--query-batch", type=int, default=256)
+     parser.add_argument("--char-name-k", type=int, default=60)
+     parser.add_argument("--char-address-k", type=int, default=60)
+     parser.add_argument("--bm25-k", type=int, default=75)
+     parser.add_argument("--batch-size", type=int, default=256)
+     parser.add_argument("--max-features", type=int, default=250000)
++    parser.add_argument("--predict-only", action="store_true", help="Reuse the local trained_checkpoint.joblib; restart test inference")
+     args = parser.parse_args()
++    if args.train_queries < 2 or args.folds < 2:
++        parser.error("Use at least two training queries and folds")
+     args.output_dir.mkdir(parents=True, exist_ok=True)
+     args.work_dir.mkdir(parents=True, exist_ok=True)
+ 
+@@ -121,22 +170,54 @@ def main():
+         batch_size=args.batch_size,
+         char_max_features=args.max_features,
+         word_max_features=args.max_features,
++        fit_sample=args.fit_sample,
++        document_batch=args.document_batch,
++        query_batch=args.query_batch,
+     )
+ 
++    if args.predict_only:
++        saved = joblib.load(args.work_dir / "trained_checkpoint.joblib")
++        config = RetrievalConfig(**saved["retrieval_config"])
++        config.query_batch = args.query_batch
++        config.document_batch = args.document_batch
++        config.batch_size = args.batch_size
++        run_inference(args, config, saved["models"], saved["columns"], saved["threshold"])
++        return
++
+     train_s1, train_targets = load_split(args.train_dir, "train")
+     ground_truth = read_tsv(args.train_dir / "train_ground_truth.tsv")
++    train_s1 = train_s1[train_s1.entity_id.isin(ground_truth.source1_entity_id)]
++    train_s1 = train_s1.sample(n=min(args.train_queries, len(train_s1)), random_state=2026)
++    ground_truth = ground_truth[ground_truth.source1_entity_id.isin(train_s1.entity_id)]
++    print(f"First-submission baseline: training on {len(train_s1):,} labeled queries; ALL targets retained", flush=True)
+     print("Generating training candidates...")
+-    train_candidates = generate_candidates(train_s1, train_targets, retrieval_config)
++    target_lookup = train_targets.set_index("entity_id", drop=False)
++    feature_parts, candidate_parts = [], []
++    for batch, pairs in iter_candidates(train_s1, train_targets, retrieval_config, args.work_dir):
++        candidate_parts.append(pairs)
++        if len(pairs):
++            selected = target_lookup.loc[pairs.candidate_entity_id.unique()]
++            print(f"Building features for {len(pairs):,} pairs", flush=True)
++            feature_parts.append(add_rank_features(build_features(pairs, batch, selected)))
++    if not feature_parts:
++        raise ValueError("No training candidates; check country fields and input text")
++    train_candidates = pd.concat(candidate_parts, ignore_index=True)
+     recall_stats = candidate_recall(train_candidates, ground_truth)
+     print("Candidate recall:", json.dumps(recall_stats, indent=2))
+ 
+     print("Building training features...")
+-    train_features = add_rank_features(build_features(train_candidates, train_s1, train_targets))
++    train_features = pd.concat(feature_parts, ignore_index=True)
+     train_features["label"] = labels_for_candidates(train_features, ground_truth)
+     columns = model_columns(train_features)
++    if train_features.label.nunique() < 2:
++        raise ValueError("Training candidates must contain both positive and negative labels")
++    del feature_parts, candidate_parts, train_candidates, train_s1, train_targets, target_lookup, selected, batch, pairs
++    gc.collect()
+ 
+     n_groups = train_features["source1_entity_id"].nunique()
+     folds = min(args.folds, n_groups)
++    if folds < 2:
++        raise ValueError("Not enough distinct query entities for validation")
+     splitter = GroupKFold(n_splits=folds)
+     oof = train_features[["source1_entity_id", "candidate_entity_id"]].copy()
+     oof["probability"] = 0.0
+@@ -144,11 +225,14 @@ def main():
+     for fold, (train_idx, valid_idx) in enumerate(splitter.split(
+         train_features, train_features["label"], groups=train_features["source1_entity_id"]
+     )):
++        print(f"Training fold {fold + 1}/{folds}", flush=True)
++        if train_features.iloc[train_idx].label.nunique() < 2:
++            raise ValueError("A training fold has only one class; increase --train-queries")
+         model = lgb.LGBMClassifier(**model_params(2026 + fold))
+         model.fit(
+             train_features.iloc[train_idx][columns], train_features.iloc[train_idx]["label"],
+             eval_set=[(train_features.iloc[valid_idx][columns], train_features.iloc[valid_idx]["label"])],
+-            callbacks=[lgb.early_stopping(80, verbose=False)],
++            callbacks=[lgb.early_stopping(80, verbose=False), lgb.log_evaluation(100)],
+         )
+         oof.loc[valid_idx, "probability"] = model.predict_proba(
+             train_features.iloc[valid_idx][columns]
+@@ -158,19 +242,12 @@ def main():
+     threshold, score, threshold_table = tune_threshold(oof, truth_map(ground_truth))
+     print(f"OOF macro F0.5={score:.6f} at threshold={threshold:.4f}")
+     threshold_table.to_csv(args.work_dir / "threshold_search.csv", index=False)
++    joblib.dump({"models": fold_models, "columns": columns, "threshold": threshold,
++                 "retrieval_config": retrieval_config.__dict__}, args.work_dir / "trained_checkpoint.joblib")
++    del train_features, oof
++    gc.collect()
+ 
+-    print("Generating test candidates and features...")
+-    test_s1, test_targets = load_split(args.test_dir, "test")
+-    test_candidates = generate_candidates(test_s1, test_targets, retrieval_config)
+-    test_features = add_rank_features(build_features(test_candidates, test_s1, test_targets))
+-    probabilities = np.mean([
+-        model.predict_proba(test_features[columns])[:, 1] for model in fold_models
+-    ], axis=0)
+-    test_scored = test_features[["source1_entity_id", "candidate_entity_id"]].copy()
+-    test_scored["probability"] = probabilities
+-
+-    write_candidate_output(test_s1, test_candidates, args.output_dir / "candidate_pairs.tsv")
+-    write_matching_output(test_s1, test_scored, threshold, args.output_dir / "matching_results.tsv")
++    run_inference(args, retrieval_config, fold_models, columns, threshold)
+ 
+     joblib.dump(fold_models, args.work_dir / "fold_models.joblib")
+     (args.work_dir / "metadata.json").write_text(json.dumps({
+diff --git a/student_resource/code/business_entity_resolution/src/retrieval.py b/student_resource/code/business_entity_resolution/src/retrieval.py
+index f31b2b3..a9fe60d 100644
+--- a/student_resource/code/business_entity_resolution/src/retrieval.py
++++ b/student_resource/code/business_entity_resolution/src/retrieval.py
+@@ -2,6 +2,9 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from typing import Iterable
++from pathlib import Path
++from tempfile import TemporaryDirectory
++from time import monotonic
+ 
+ import numpy as np
+ import pandas as pd
+@@ -20,6 +23,9 @@ class RetrievalConfig:
+     batch_size: int = 256
+     char_max_features: int = 250_000
+     word_max_features: int = 250_000
++    fit_sample: int = 5000
++    document_batch: int = 10000
++    query_batch: int = 512
+ 
+ 
+ def prepare_records(df: pd.DataFrame) -> pd.DataFrame:
+@@ -94,66 +100,126 @@ def _add_results(
+             bucket.setdefault(target_id, {})[score_name] = float(score)
+ 
+ 
+-def generate_candidates(
+-    source1: pd.DataFrame,
+-    targets: pd.DataFrame,
+-    config: RetrievalConfig,
+-) -> pd.DataFrame:
+-    """Country-aware hybrid retrieval using char TF-IDF and BM25 weighting."""
+-    source1 = prepare_records(source1).reset_index(drop=True)
+-    targets = prepare_records(targets).reset_index(drop=True)
+-    all_results: list[dict[str, dict[str, float]]] = [dict() for _ in range(len(source1))]
+-
+-    for country in source1["country"].drop_duplicates():
+-        q_idx = np.flatnonzero(source1["country"].to_numpy() == country)
+-        d_idx = np.flatnonzero(targets["country"].to_numpy() == country)
+-        if not len(q_idx) or not len(d_idx):
+-            continue
+-        q = source1.iloc[q_idx]
+-        d = targets.iloc[d_idx]
+-        local_store = [dict() for _ in range(len(q))]
+-        target_ids = d["entity_id"].to_numpy()
+-
+-        for column, score_name, top_k, ngrams in [
+-            ("name_norm", "char_name", config.char_name_k, (2, 5)),
+-            ("address_norm", "char_address", config.char_address_k, (2, 5)),
+-        ]:
+-            vectorizer = TfidfVectorizer(
+-                analyzer="char_wb", ngram_range=ngrams, min_df=1,
+-                max_features=config.char_max_features, sublinear_tf=True,
+-                dtype=np.float32,
+-            )
+-            docs = vectorizer.fit_transform(d[column])
+-            queries = vectorizer.transform(q[column])
+-            iterator = _topk_sparse_product(queries, docs, top_k, config.batch_size)
+-            _add_results(local_store, 0, target_ids, iterator, score_name)
+-
+-        word_vectorizer = CountVectorizer(
+-            analyzer="word", ngram_range=(1, 2), min_df=1,
+-            max_features=config.word_max_features, binary=False,
+-        )
+-        doc_counts = word_vectorizer.fit_transform(d["combined_norm"])
+-        query_counts = word_vectorizer.transform(q["combined_norm"])
+-        bm25_docs, idf = _bm25_document_matrix(doc_counts)
+-        bm25_queries = (query_counts > 0).astype(np.float32).multiply(idf).tocsr()
+-        iterator = _topk_sparse_product(
+-            bm25_queries, bm25_docs, config.bm25_k, config.batch_size
+-        )
+-        _add_results(local_store, 0, target_ids, iterator, "bm25")
+-
+-        for local_i, global_i in enumerate(q_idx):
+-            all_results[global_i] = local_store[local_i]
+-
+-    rows = []
+-    for query_i, candidates in enumerate(all_results):
+-        source_id = source1.iloc[query_i]["entity_id"]
+-        for target_id, scores in candidates.items():
+-            rows.append({
+-                "source1_entity_id": source_id,
+-                "candidate_entity_id": target_id,
+-                "char_name": scores.get("char_name", 0.0),
+-                "char_address": scores.get("char_address", 0.0),
+-                "bm25": scores.get("bm25", 0.0),
+-                "retrieval_methods": len(scores),
+-            })
+-    return pd.DataFrame(rows)
++
++
++PAIR_COLUMNS = ["source1_entity_id", "candidate_entity_id", "char_name",
++                "char_address", "bm25", "retrieval_methods"]
++
++
++def _save_matrix(path, matrix):
++    # Separate arrays allow read-only memory mapping (no NPZ decompression/copy).
++    for name in ("data", "indices", "indptr"):
++        np.save(str(path) + f".{name}.npy", getattr(matrix, name))
++
++
++def _load_matrix(path, shape):
++    arrays = [np.load(str(path) + f".{name}.npy", mmap_mode="r")
++              for name in ("data", "indices", "indptr")]
++    return sparse.csr_matrix(tuple(arrays), shape=shape, copy=False)
++
++
++def iter_candidates(source1, targets, config, work_dir=None):
++    """Bounded sparse indexes on disk; vocabulary/IDF estimated on a fixed sample.
++
++    All targets remain searchable. Each shard uses the SAME fitted vectorizer,
++    so shard scores can be merged into a country-wide top K. Country blocking
++    retains the original baseline assumption; cross-country matches are excluded.
++    """
++    if min(config.fit_sample, config.document_batch, config.query_batch,
++           config.batch_size, config.char_name_k, config.char_address_k,
++           config.bm25_k) < 1:
++        raise ValueError("Batch sizes, sample size and retrieval K must be positive")
++    source1 = source1.reset_index(drop=True)
++    targets = targets.reset_index(drop=True)
++    target_ids = targets.entity_id.to_numpy()
++    qc = source1.country.fillna("").str.strip().str.casefold()
++    dc = targets.country.fillna("").str.strip().str.casefold()
++    started, completed = monotonic(), 0
++    for country in qc.drop_duplicates():
++        qrows = np.flatnonzero(qc.to_numpy() == country)
++        drows = np.flatnonzero(dc.to_numpy() == country)
++        print(f"Index country={country!r}: {len(qrows):,} queries / {len(drows):,} targets", flush=True)
++        with TemporaryDirectory(prefix="retrieval-", dir=work_dir) as temporary:
++            methods = []
++            if len(drows):
++                rng = np.random.default_rng(2026)
++                sampled = rng.choice(drows, min(config.fit_sample, len(drows)), replace=False)
++                sample = prepare_records(targets.iloc[sampled])
++                for column, name, k in [("name_norm", "char_name", config.char_name_k),
++                                         ("address_norm", "char_address", config.char_address_k),
++                                         ("combined_norm", "bm25", config.bm25_k)]:
++                    if name == "bm25":
++                        vectorizer = CountVectorizer(ngram_range=(1, 2), dtype=np.float32,
++                                                    max_features=config.word_max_features)
++                    else:
++                        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5),
++                            dtype=np.float32, sublinear_tf=True, max_features=config.char_max_features)
++                    try:
++                        fitted = vectorizer.fit_transform(sample[column])
++                    except ValueError as exc:
++                        if "empty vocabulary" not in str(exc):
++                            raise
++                        print(f"Skipping empty {name} index", flush=True)
++                        continue
++                    idf, avg_len = None, None
++                    if name == "bm25":
++                        df = np.asarray((fitted > 0).sum(axis=0)).ravel()
++                        idf = np.log1p((len(sample) - df + .5) / (df + .5)).astype(np.float32)
++                        avg_len = max(float(np.asarray(fitted.sum(axis=1)).mean()), 1.)
++                    del fitted
++                    shards = []
++                    for start in range(0, len(drows), config.document_batch):
++                        indices = drows[start:start + config.document_batch]
++                        records = prepare_records(targets.iloc[indices])
++                        matrix = vectorizer.transform(records[column]).tocsr()
++                        if name == "bm25":
++                            lengths = np.asarray(matrix.sum(axis=1)).ravel()
++                            lengths = np.repeat(lengths, np.diff(matrix.indptr))
++                            matrix.data *= 2.5 / (matrix.data + 1.5 * (.25 + .75 * lengths / avg_len))
++                            matrix.data *= idf[matrix.indices]
++                        path = Path(temporary) / f"{name}-{start}.npz"
++                        _save_matrix(path, matrix)
++                        shards.append((path, indices, matrix.shape))
++                        print(f"  {name} index {min(start + config.document_batch, len(drows)):,}/{len(drows):,}", flush=True)
++                        del records, matrix
++                    methods.append((column, name, k, vectorizer, shards))
++                del sample
++            for start in range(0, len(qrows), config.query_batch):
++                batch = source1.iloc[qrows[start:start + config.query_batch]]
++                prepared = prepare_records(batch)
++                merged = [{} for _ in range(len(batch))]
++                for column, name, k, vectorizer, shards in methods:
++                    queries = vectorizer.transform(prepared[column]).tocsr()
++                    if name == "bm25":
++                        # IDF is already in the document weights; do not square it.
++                        queries.data[:] = 1.
++                    best = [{} for _ in range(len(batch))]
++                    for path, indices, shape in shards:
++                        matrix = _load_matrix(path, shape)
++                        for row, found, scores in _topk_sparse_product(queries, matrix, k, config.batch_size):
++                            bucket = best[row]
++                            bucket.update(zip(indices[found].tolist(), scores.tolist()))
++                            if len(bucket) > k:
++                                best[row] = dict(sorted(bucket.items(), key=lambda item: (-item[1], item[0]))[:k])
++                        del matrix
++                    for row, bucket in enumerate(best):
++                        for target_row, score in bucket.items():
++                            target_id = target_ids[target_row]
++                            merged[row].setdefault(target_id, {})[name] = score
++                rows = []
++                for entity_id, candidates in zip(batch.entity_id, merged):
++                    for target_id, scores in candidates.items():
++                        rows.append((entity_id, target_id, scores.get("char_name", 0.),
++                            scores.get("char_address", 0.), scores.get("bm25", 0.), len(scores)))
++                completed += len(batch)
++                elapsed = monotonic() - started
++                eta = elapsed / max(completed, 1) * (len(source1) - completed)
++                fraction = completed / len(source1)
++                bar = "#" * int(20 * fraction) + "-" * (20 - int(20 * fraction))
++                print(f"Retrieval [{bar}] {completed:,}/{len(source1):,} ({fraction:.1%}) | elapsed {elapsed/60:.1f}m | approximate ETA {eta/60:.1f}m", flush=True)
++                yield batch, pd.DataFrame(rows, columns=PAIR_COLUMNS)
++
++
++def generate_candidates(source1, targets, config):
++    parts = [pairs for _, pairs in iter_candidates(source1, targets, config)]
++    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=PAIR_COLUMNS)
+diff --git a/student_resource/run_full.ps1 b/student_resource/run_full.ps1
+index 55fc5ea..468b380 100644
+--- a/student_resource/run_full.ps1
++++ b/student_resource/run_full.ps1
+@@ -1,18 +1,23 @@
+ $ErrorActionPreference = "Stop"
++Set-Location $PSScriptRoot
+ 
+ python -m pip install -r code/business_entity_resolution/requirements.txt
+ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+ 
+-python -m code.business_entity_resolution.src.pipeline `
++python -u -m code.business_entity_resolution.src.pipeline `
+   --train-dir dataset/train `
+   --test-dir dataset/test `
+   --output-dir output `
+   --work-dir artifacts `
+-  --folds 5 `
++  --folds 3 `
++  --train-queries 2000 `
++  --fit-sample 5000 `
++  --document-batch 10000 `
++  --query-batch 256 `
+   --char-name-k 60 `
+   --char-address-k 60 `
+   --bm25-k 75 `
+-  --batch-size 256 `
++  --batch-size 64 `
+   --max-features 250000
+ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+ 
+diff --git a/student_resource/run_predict.ps1 b/student_resource/run_predict.ps1
+new file mode 100644
+index 0000000..f31c54e
+--- /dev/null
++++ b/student_resource/run_predict.ps1
+@@ -0,0 +1,18 @@
++$ErrorActionPreference = "Stop"
++Set-Location $PSScriptRoot
++# Only use a checkpoint created locally by run_full.ps1; joblib is not safe for untrusted files.
++python -u -m code.business_entity_resolution.src.pipeline `
++  --train-dir dataset/train `
++  --test-dir dataset/test `
++  --output-dir output `
++  --work-dir artifacts `
++  --query-batch 256 `
++  --document-batch 10000 `
++  --batch-size 64 `
++  --predict-only
++if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
++python utils/validate_submission.py `
++  --matching output/matching_results.tsv `
++  --candidate output/candidate_pairs.tsv `
++  --test-dir dataset/test
++exit $LASTEXITCODE
+diff --git a/student_resource/tests/test_streaming.py b/student_resource/tests/test_streaming.py
+new file mode 100644
+index 0000000..2b0f203
+--- /dev/null
++++ b/student_resource/tests/test_streaming.py
+@@ -0,0 +1,56 @@
++import tempfile
++import unittest
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++
++from code.business_entity_resolution.src.retrieval import RetrievalConfig, iter_candidates
++from code.business_entity_resolution.src.features import build_features
++
++
++def records(rows):
++    return pd.DataFrame(rows, columns=["entity_id", "business_name", "business_address", "country"])
++
++
++class StreamingTests(unittest.TestCase):
++    def test_shard_and_query_sizes_do_not_change_scores(self):
++        targets = records([
++            ("S2-1", "Alpha Bakery", "12 High Street", "IN"),
++            ("S2-2", "Beta Bakery", "90 Low Street", "IN"),
++            ("S3-1", "Alpha Bakery", "12 High Street", "IN"),
++            ("S3-2", "Gamma Bank", "4 Park Road", "IN"),
++        ])
++        queries = records([("S1-1", "Alpha Bakery", "12 High Street", "in"),
++                           ("S1-2", "Beta Bakery", "90 Low Street", "IN")])
++        outputs = []
++        for shard, batch in [(1, 1), (100, 100)]:
++            config = RetrievalConfig(document_batch=shard, query_batch=batch,
++                                     char_name_k=4, char_address_k=4, bm25_k=4)
++            frames = [p for _, p in iter_candidates(queries, targets, config)]
++            outputs.append(pd.concat(frames).sort_values(["source1_entity_id", "candidate_entity_id"]).reset_index(drop=True))
++        pd.testing.assert_frame_equal(outputs[0], outputs[1], check_exact=False, atol=1e-6, rtol=1e-6)
++        self.assertIn("S2-1", outputs[0].candidate_entity_id.tolist())
++        features = build_features(outputs[0], queries, targets)
++        self.assertTrue(np.isfinite(features.select_dtypes("number").to_numpy()).all())
++        # At a tied K boundary any equally-scored ID is valid, but the cap holds.
++        capped = pd.concat([p for _, p in iter_candidates(queries, targets,
++            RetrievalConfig(document_batch=1, char_name_k=1, char_address_k=1, bm25_k=1))])
++        self.assertLessEqual(capped.groupby("source1_entity_id").size().max(), 3)
++
++    def test_empty_country_and_empty_text(self):
++        queries = records([("S1-1", "", "", "IN"), ("S1-2", "a", "", "XX")])
++        targets = records([("S2-1", "", "", "IN")])
++        with tempfile.TemporaryDirectory() as directory:
++            results = list(iter_candidates(queries, targets, RetrievalConfig(), directory))
++            self.assertEqual(sum(len(q) for q, _ in results), 2)
++            self.assertTrue(all(p.empty for _, p in results))
++            self.assertEqual(list(Path(directory).iterdir()), [])
++
++    def test_invalid_batch(self):
++        with self.assertRaises(ValueError):
++            list(iter_candidates(records([]), records([]), RetrievalConfig(query_batch=0)))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.51.1
+

@@ -1,0 +1,8 @@
+artifacts/
+artifacts_fast/
+output/
+output_fast/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.joblib

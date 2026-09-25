@@ -18,7 +18,7 @@ ABBREVIATIONS = {
 
 
 def _unicode_text(value: object) -> str:
-    if value is None:
+    if value is None:                                                                                                                                                                                                                                                                                                                                                                                            
         return ""
     value = str(value).strip().lower()
     if value in {"nan", "none", "null"}:
